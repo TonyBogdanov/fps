@@ -1,0 +1,15 @@
+services:
+  interpolation:
+    build: .
+    network_mode: host
+    command: [ tail, -f, /dev/null ]
+    stop_grace_period: 10s
+    volumes:
+      - ./data:/app/data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [ gpu ]
