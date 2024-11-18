@@ -1,3 +1,2 @@
-docker buildx build --tag tonybogdanov/fps:latest .
-: docker push tonybogdanov/fps:latest
-: docker compose run --remove-orphans --build interpolation
+go build main.go
+main.exe C:\Users\tonyb\Desktop\x.mp4
