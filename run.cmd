@@ -1,2 +1,2 @@
 go build main.go
-main.exe C:\Users\tonyb\Desktop\x.mp4
+main.exe E:\Flowframes\Flowframes\2.mp4

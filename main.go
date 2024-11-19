@@ -8,31 +8,24 @@ import (
 	"image/color"
 	"image/png"
 	"log"
-	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
-
-const TargetBlockSize = 448
-const MemoryLimit = 4
 
 var inputPath string
 var projectDir string
 var meta *Metadata
 
 type Metadata struct {
-	Width       int
-	Height      int
-	Frames      int
-	FPS         int
-	BlockWidth  int
-	BlockHeight int
+	Width  int
+	Height int
+	Frames int
+	FPS    float64
 }
 
 func die(err error) {
@@ -49,14 +42,14 @@ func pad(value, length int) string {
 	return fmt.Sprintf("%0*d", length, value)
 }
 
-func eval(value string) int {
+func eval(value string) float64 {
 	expr, err := govaluate.NewEvaluableExpression(value)
 	die(err)
 
 	result, err := expr.Evaluate(map[string]interface{}{})
 	die(err)
 
-	return int(math.Round(result.(float64)))
+	return result.(float64)
 }
 
 func probe(file, stream string) string {
@@ -86,16 +79,6 @@ func exists(file string) bool {
 	}
 
 	return false
-}
-
-func computeBlockSize(size int) int {
-	for i := 1; i <= size; i++ {
-		if 0 == size%i && TargetBlockSize >= size/i {
-			return i
-		}
-	}
-
-	return size
 }
 
 func run(setup func(queue func(job func()))) {
@@ -142,6 +125,14 @@ func run(setup func(queue func(job func()))) {
 	}
 }
 
+func progress(message string, total int) func(value int) {
+	message += " %d of %d [%.2f%%].\n"
+
+	return func(value int) {
+		log.Printf(message, value, total, 100*float64(value)/float64(total))
+	}
+}
+
 func decodeImage(file string) image.Image {
 	reader, err := os.Open(file)
 	die(err)
@@ -163,11 +154,7 @@ func encodeImage(img image.Image, file string) {
 
 func initialize() {
 	log.Printf("Initializing project.\n")
-	if len(os.Args) < 2 {
-		die(fmt.Errorf("no input provided, drop a video file onto this executable"))
-	}
-
-	input, err := filepath.Abs(os.Args[1])
+	input, err := filepath.Abs(os.Args[0])
 	die(err)
 
 	executable, err := os.Executable()
@@ -184,23 +171,20 @@ func initialize() {
 
 	log.Printf("Analyzing video file: %s.\n", inputPath)
 	meta = &Metadata{
-		Frames: eval(probe(inputPath, "stream=nb_frames")),
+		Frames: int(eval(probe(inputPath, "stream=nb_frames"))),
 		FPS:    eval(probe(inputPath, "stream=avg_frame_rate")),
 	}
 
 	rotation := probe(inputPath, "stream_side_data=rotation")
 	if "" == rotation || "-180" == rotation || "180" == rotation {
-		meta.Width = eval(probe(inputPath, "stream=width"))
-		meta.Height = eval(probe(inputPath, "stream=height"))
+		meta.Width = int(eval(probe(inputPath, "stream=width")))
+		meta.Height = int(eval(probe(inputPath, "stream=height")))
 	} else if "-90" == rotation || "90" == rotation || "-270" == rotation || "270" == rotation {
-		meta.Width = eval(probe(inputPath, "stream=height"))
-		meta.Height = eval(probe(inputPath, "stream=width"))
+		meta.Width = int(eval(probe(inputPath, "stream=height")))
+		meta.Height = int(eval(probe(inputPath, "stream=width")))
 	} else {
 		die(fmt.Errorf("Unknown rotation value: %s.\n", rotation))
 	}
-
-	meta.BlockWidth = computeBlockSize(meta.Width * 5)
-	meta.BlockHeight = computeBlockSize(meta.Height)
 }
 
 func unpackVideo() {
@@ -220,11 +204,12 @@ func unpackVideo() {
 
 func unpackFrames() {
 	run(func(queue func(job func())) {
+		tick := progress("Unpacking frame:", meta.Frames)
+
 		for i := 1; i <= meta.Frames; i++ {
 			queue(func(i int) func() {
 				return func() {
-					log.Printf("Unpacking frame %d of %d [%.2f%%].\n", i, meta.Frames,
-						100*float64(i)/float64(meta.Frames))
+					tick(i)
 
 					packedPath := filepath.Join(projectDir, "p-"+pad(i, 8)+".png")
 					unpackedPath := filepath.Join(projectDir, "u-"+pad(i, 8)+".png")
@@ -282,50 +267,56 @@ func unpackFrames() {
 }
 
 func interpolateFrames() {
-	log.Printf(
-		"Interpolating %d video frames with block size %dx%d.\n",
-		meta.Frames,
-		5*meta.Width/meta.BlockWidth,
-		meta.Height/meta.BlockHeight,
-	)
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+
+	go func() {
+		tick := progress("Interpolating frame:", meta.Frames*2)
+
+		for i := 1; i <= meta.Frames*2; i++ {
+			tick(i)
+
+			for !exists(filepath.Join(projectDir, pad(i, 8)+".png")) {
+				time.Sleep(200 * time.Millisecond)
+			}
+		}
+
+		wg.Done()
+	}()
 
 	cmd := exec.Command(
-		"docker", "run",
-		"--rm",
-		"--network", "host",
-		"--gpus", "all",
-		"--memory", fmt.Sprintf("%dg", MemoryLimit),
-		"-v", fmt.Sprintf("%s:/data", projectDir),
-		"tonybogdanov/fps:latest",
-		"python",
-		"-m", "eval.interpolator_cli",
-		"--pattern", "/data",
-		"--model_path", "/models/pretrained_models/film_net/Style/saved_model",
-		"--block_width", strconv.Itoa(meta.BlockWidth),
-		"--block_height", strconv.Itoa(meta.BlockHeight),
-		"--times_to_interpolate", "1",
+		filepath.Join(projectDir, "../../rife-ncnn-vulkan/rife-ncnn-vulkan.exe"),
+		"-i", projectDir,
+		"-o", projectDir,
+		"-m", filepath.Join(projectDir, "../../rife-ncnn-vulkan/rife-v4"),
+		"-f", "%08d.png",
+		"-j", "4:8:8",
 	)
 
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
 	die(cmd.Run())
+	wg.Wait()
+
+	log.Printf("Cleaning up frame leftovers.\n")
+	die(os.Remove(filepath.Join(projectDir, pad(meta.Frames*2, 8)+".png")))
 
 	for i := 1; i <= meta.Frames; i++ {
-		log.Printf("Cleaning up frame %d of %d [%.2f%%].\n", i, meta.Frames, 100*float64(i)/float64(meta.Frames))
 		die(os.Remove(filepath.Join(projectDir, "u-"+pad(i, 8)+".png")))
 	}
 }
 
 func packFrames() {
 	run(func(queue func(job func())) {
+		tick := progress("Packing frame:", (meta.Frames-1)*2+1)
+
 		for i := 1; i <= (meta.Frames-1)*2+1; i++ {
 			queue(func(i int) func() {
 				return func() {
-					log.Printf("Packing frame %d of %d [%.2f%%].\n", i, (meta.Frames-1)*2+1,
-						100*float64(i)/float64((meta.Frames-1)*2+1))
+					tick(i)
 
-					unpackedPath := filepath.Join(projectDir, "f-"+pad(i-1, 8)+".png")
+					unpackedPath := filepath.Join(projectDir, pad(i, 8)+".png")
 					packedPath := filepath.Join(projectDir, "p-"+pad(i, 8)+".png")
 
 					unpacked := decodeImage(unpackedPath)
@@ -360,14 +351,14 @@ func packFrames() {
 }
 
 func packVideo() {
-	fps := meta.FPS * 2
-	outputPath := filepath.Join(filepath.Dir(inputPath), fmt.Sprintf("%s_%dfps.mp4", filepath.Base(projectDir), fps))
+	fps := meta.FPS * 2.0
+	outputPath := filepath.Join(filepath.Dir(inputPath), fmt.Sprintf("%s_%.1ffps.mp4", filepath.Base(projectDir), fps))
 
 	log.Printf("Packing video frames from: %s to: %s.\n", projectDir, outputPath)
 	cmd := exec.Command(
 		"ffmpeg", "-y",
 		"-i", inputPath,
-		"-framerate", strconv.Itoa(fps),
+		"-framerate", fmt.Sprintf("%.6f", fps),
 		"-color_primaries", "bt2020",
 		"-color_trc", "arib-std-b67",
 		"-i", filepath.Join(projectDir, "p-%08d.png"),
@@ -375,10 +366,9 @@ func packVideo() {
 		"-map", "1:v:0",
 		"-map_metadata", "0",
 		"-movflags", "use_metadata_tags",
-		"-map_metadata:s:d", "0:s:d",
 		"-map_metadata:s:a", "0:s:a",
 		"-map_metadata:s:v", "0:s:v",
-		"-metadata", fmt.Sprintf("com.android.capture.fps=%d.000000", fps),
+		"-metadata", fmt.Sprintf("com.android.capture.fps=%.6f", fps),
 		"-c:a", "copy",
 		"-c:v", "hevc",
 		"-crf", "18",
@@ -394,6 +384,13 @@ func packVideo() {
 }
 
 func main() {
+	if 1 >= len(os.Args) {
+		time.Sleep(time.Minute)
+		return
+	}
+
+	os.Args = os.Args[1:]
+
 	initialize()
 
 	unpackVideo()
@@ -403,4 +400,7 @@ func main() {
 	packVideo()
 
 	die(os.RemoveAll(projectDir))
+	die(os.Remove(inputPath))
+
+	main()
 }
